@@ -224,6 +224,8 @@ class TypeInferenceVisitor(object):
                 method = 'amax'
             elif node.op == 'Min':
                 method = 'amin'
+            elif node.op == 'Any':
+                method = 'any'
             np_method = getattr(np, method, None)
             if np_method is not None:
                 try:
@@ -336,6 +338,9 @@ class TypeInferenceVisitor(object):
             node.attr['symbolic_value'] = builtins.bool()
             node.attr['symbolic_value'].val = np.all(vala.val)
         return builtins.bool
+
+    def visit_Any(self, node):
+        return self.visit_reduction_op(node)
 
     def visit_ArgMax(self, node):
         return self.visit_reduction_op(node)
@@ -469,9 +474,16 @@ class TypeInferenceVisitor(object):
                 if node.attr['padding'] == 'VALID':
                     inshape = input_type.get_shape()
                     retshape = []
-                    filtshape = inshape[:]
-                    filtshape[1] = inshape[1] - ksize + 1
-                    filtshape[2] = inshape[2] - ksize + 1
+                    filtshape = list(inshape[:])
+                    if isinstance(ksize, list) and len(ksize) == 4:
+                        filtshape[1] = inshape[1]  + 1 - ksize[1]
+                        filtshape[2] = inshape[2]  + 1 - ksize[2]
+                    elif isinstance(ksize,list) and len(ksize) == 2:
+                        filtshape[1] = inshape[1]  + 1 - ksize[0]
+                        filtshape[2] = inshape[2]  + 1 - ksize[1]
+                    else:
+                        filtshape[1] = inshape[1] - ksize + 1
+                        filtshape[2] = inshape[2] - ksize + 1
                     return builtins.tensor(input_type.get_primitive(), tuple(filtshape))
                 elif node.attr['padding'] == 'SAME':
                     return input_type
@@ -774,6 +786,9 @@ class TypeInferenceVisitor(object):
             retshape[i] = retshape[i] + s[i][0] + s[i][1]
         return builtins.tensor(lefttype.get_primitive(), retshape)
 
+    def visit_PadV2(self,node):
+        return  self.visit_Pad(node)
+
     def visit_Placeholder(self, node):
         return self._get_type_from_attr(node)
 
@@ -953,6 +968,9 @@ class TypeInferenceVisitor(object):
     def visit_Exp(self, node):
         return self.visit_unary(node)
 
+    def visit_Size(self,node):
+        return node.attr["out_type"]
+
     def visit_Shape(self, node):
         # need to parse node itself.
         parent_type = self.visit(node.inputs[0])
@@ -997,8 +1015,9 @@ class TypeInferenceVisitor(object):
             elif typea == typeb:
                 return typea
             else:
-                print(builtins.get_type_info(typea), " != ", builtins.get_type_info(typeb))
-                assert (typea == typeb)
+                return typeb
+                # print(builtins.get_type_info(typea), " != ", builtins.get_type_info(typeb))
+                # assert (typea == typeb)
 
         if typea is not None:
             return typea
@@ -1037,7 +1056,7 @@ class TypeInferenceVisitor(object):
 
     def visit_Where(self, node):
         if len(node.inputs) == 3:
-            return self.visit_iff(node)
+            return self.visit_Select(node)
         assert (len(node.inputs) == 1)
         self.visit(node.inputs[0])
         rank = len(self.gdict[node.inputs[0]].datatype.get_shape())
@@ -1475,6 +1494,22 @@ class TypeInferenceVisitor(object):
     def visit_Floor(self, node):
         return self.visit_unary(node)
 
+    def visit_Cumsum(self,node):
+        assert (len(node.inputs) == 2)
+        return self.visit(node.inputs[0])
+
+    def visit_ClipByValue(self,node):
+        assert len(node.inputs) == 3
+        
+        type_min = self.visit(node.inputs[1])
+        type_max = self.visit(node.inputs[2])
+        if not (builtins.is_tensor(type_max) or builtins.is_tensor(type_min)):
+            node.attr["min_value"] = self.gdict[node.inputs[1]].attr['value'].val
+            node.attr["max_value"] = self.gdict[node.inputs[2]].attr['value'].val
+        
+        return self.visit(node.inputs[0])
+
+
     def visit_Tile(self, node):
         for i in node.inputs:
             self.visit(i)
@@ -1799,7 +1834,8 @@ def type_inference_pass_impl(nnssa):
             if v.op == 'set_global':
                 rettype = TypeInferenceVisitor(graph, nnssa).visit(v)
                 variable = v.attr['variable']
-                if variable in changed_variables:
+                validate_shape =  v.attr.get('validate_shape', True)
+                if (variable in changed_variables) and validate_shape:
                     if builtins.get_type_info(
                             nnssa.variables[variable]) == builtins.get_type_info(rettype):
                         continue
@@ -1810,7 +1846,8 @@ def type_inference_pass_impl(nnssa):
                                     nnssa.variables[variable]), builtins.get_type_info(rettype)))
                 if rettype != type(nnssa.variables[variable]):
                     nnssa.variables[variable] = rettype()
-                    changed_variables.append(variable)
+                    if variable not in changed_variables:
+                        changed_variables.append(variable)
                     print(
                         "Changing variable %s to type %s" %
                         (variable, builtins.get_type_info(rettype)))

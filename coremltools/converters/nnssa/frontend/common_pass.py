@@ -22,10 +22,14 @@ def common_pass(ssa, resume_on_errors=False, **kwargs):
 
     if resume_on_errors == False:
         for p in passes:
+            if p == shift_get_global_to_set_global:# or type_inference_pass:
+                continue
             p(ssa)
     else:
         for p in passes:
             try:
+                if p == shift_get_global_to_set_global:# or type_inference_pass:
+                    continue
                 p(ssa)
             except:
                 tb = traceback.format_exc()

@@ -59,13 +59,13 @@ def load(tfgraph, resume_on_errors=False, **kwargs):
                 print(tb)
                 print("Ignoring and continuing to next pass")
 
-    common_pass(ssa)
+    common_pass(ssa, resume_on_errors= resume_on_errors)
 
     for f in ssa.functions.values():
         f.find_inputs_and_outputs()
-    # check that type inference is complete
-    if resume_on_errors == False:
-        for f in ssa.functions.values():
-            for n in f.graph.values():
-                assert (n.datatype is not None)
+    # # check that type inference is complete
+    # if resume_on_errors == False:
+    #     for f in ssa.functions.values():
+    #         for n in f.graph.values():
+    #             assert (n.datatype is not None)
     return ssa

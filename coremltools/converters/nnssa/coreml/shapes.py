@@ -43,6 +43,11 @@ def _slice_static(layer_spec, input_shapes):
             output_shape[idx] = int((end_index - begin_index) / step)
     return [output_shape]
 
+def _slice_dynamic(layer_spec, input_shapes):
+    input_shape = input_shapes[0]
+    rank = len(input_shape)
+    output_shape = [-1] * rank
+    return [output_shape]
 
 def _squeeze(layer_spec, input_shapes):
     axes = list(layer_spec.squeeze.axes)
@@ -54,9 +59,9 @@ def _squeeze(layer_spec, input_shapes):
     output_shape = input_shape[:]
     for axis in axes:
         idx = axis if axis >= 0 else rank + axis
-        if input_shape[idx] != 1:
-            raise ValueError(
-                '[Shaper] Cannot squeeze on index %d of shape %s' % (axis, str(input_shape)))
+        # if input_shape[idx] != 1:
+        #     raise ValueError(
+        #         '[Shaper] Cannot squeeze on index %d of shape %s' % (axis, str(input_shape)))
         output_shape = output_shape[:idx] + output_shape[idx + 1:]
     return [output_shape]
 
@@ -111,7 +116,7 @@ def _broadcastable(layer_spec, input_shapes):
             return None
 
     max_rank = max([len(s) for s in input_shapes])
-    extended_input_shapes = [[1] * (max_rank - len(s)) + s for s in input_shapes]
+    extended_input_shapes = [[1] * (max_rank - len(s)) + list(s) for s in input_shapes]
     output_shape = [1] * max_rank
     for i_dim in range(max_rank):
         for s in extended_input_shapes:
@@ -202,12 +207,17 @@ def _expand_dims(layer_spec, input_shapes):
 
     output_shape = input_shape[:]
     for axis in axes:
-        output_shape = output_shape[0:axis] + [1] + output_shape[axis:]
+        output_shape = list(output_shape[0:axis]) + [1] + list(output_shape[axis:])
     return [output_shape]
 
+def _where_non_zero(layer_spec, input_shapes):
+    input_shape = input_shapes[0]
+    rank = len(input_shape)
+    output_shape = [-1,rank]
+    return [output_shape]
 
-def _stack_nd(layer_spec, input_shapes):
-    axis = layer_spec.stackND.axis
+def _stack(layer_spec, input_shapes):
+    axis = layer_spec.stack.axis
     num_inputs = len(layer_spec.input)
     shape = input_shapes[0]
     for s in input_shapes:
@@ -239,6 +249,12 @@ def _batched_mat_mul(layer_spec, input_shapes):
     else:
         raise NotImplementedError('[Shaper] Batched MatMul requires either 1 or 2 inputs')
 
+
+def _tile(layer_spec, input_shapes):
+    params = layer_spec.tile
+    reps = params.reps
+    assert len(reps) == len(input_shapes[0])
+    return [[reps[i] * input_shapes[0][i] for i in range(len(reps))]]
 
 def _embedding_nd(layer_spec, input_shapes):
     input_shape = input_shapes[0]
@@ -350,6 +366,7 @@ _LAYER_REGISTRY = {
     'getShape': _get_shape,
     'fillDynamic': _fill_dynamic,
     'sliceStatic': _slice_static,
+    'sliceDynamic': _slice_dynamic,
     'squeeze': _squeeze,
     'rangeStatic': _range_static,
     'rangeDynamic': _range_dynamic,
@@ -357,11 +374,12 @@ _LAYER_REGISTRY = {
     'loadConstantND': _load_constant_nd,
     'gather': _gather,
     'scatter': _scatter,
-    'greatherThan': _broadcastable,
+    'greaterThan': _broadcastable,
     'logicalOr': _broadcastable,
     'logicalNot': _identity,
     'lessThan': _broadcastable,
     'greaterEqual': _broadcastable,
+    'equal': _broadcastable,
     'notEqual': _broadcastable,
     'logicalAnd': _broadcastable,
     'add': _add,
@@ -373,8 +391,10 @@ _LAYER_REGISTRY = {
     'reverseSeq': _reverse_seq,
     'copy': _copy,
     'expandDims': _expand_dims,
-    'stackND': _stack_nd,
+    'stack': _stack,
+    'whereNonZero': _where_non_zero,
     'addBroadcastable': _broadcastable,
+    'powBroadcastable': _broadcastable,
     'subtractBroadcastable': _broadcastable,
     'divideBroadcastable': _broadcastable,
     'whereBroadcastable': _broadcastable,
@@ -405,8 +425,9 @@ _LAYER_REGISTRY = {
     'batchedMatmul': _batched_mat_mul,
     'sin': _identity,
     'cos': _identity,
-    'round': _identity
-}
+    'round': _identity,
+    'tile': _tile
+    }
 
 
 def _get_translator_function(layer_type):
@@ -436,7 +457,7 @@ def get_common_shape(x, y):
     """
     z = None
     if len(x) == len(y):
-        z = x
+        z = list(x)
         for idx in range(len(x)):
             z[idx] = x[idx] if x[idx] == y[idx] else -1
     return z
@@ -659,6 +680,8 @@ def propagate_single_layer(layer, shapes, output_shapes=None):
 
     # Register output blobs
     for k, blob_name in enumerate(layer.output):
+        if blob_name == "SeevaModel/encoder/__QNNV__encoder_state_10":
+            print ("here")
         if blob_name not in shapes:
             shapes[blob_name] = output_shapes[k]
         else:

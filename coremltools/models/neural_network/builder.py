@@ -515,8 +515,8 @@ class NeuralNetworkBuilder(object):
             return
 
         # assuming single sizes here
-        input_types = [datatypes.Array(dim) for (name, dim) in optionals_in]
-        output_types = [datatypes.Array(dim) for (name, dim) in optionals_out]
+        input_types = [datatypes.Array(*dim) for (name, dim) in optionals_in]
+        output_types = [datatypes.Array(*dim) if dim else None for (name, dim) in optionals_out]
 
         input_names = [str(name) for (name, dim) in optionals_in]
         output_names = [str(name) for (name, dim) in optionals_out]
