@@ -226,6 +226,8 @@ class TypeInferenceVisitor(object):
                 method = 'amin'
             elif node.op == 'Any':
                 method = 'any'
+            elif node.op == 'All':
+                method = 'all'
             np_method = getattr(np, method, None)
             if np_method is not None:
                 try:
@@ -332,12 +334,7 @@ class TypeInferenceVisitor(object):
         return self.visit(node.inputs[0])
 
     def visit_All(self, node):
-        self.visit(node.inputs[0])
-        vala = self.gdict[node.inputs[0]].attr['symbolic_value']
-        if vala is not None:
-            node.attr['symbolic_value'] = builtins.bool()
-            node.attr['symbolic_value'].val = np.all(vala.val)
-        return builtins.bool
+        return self.visit_reduction_op(node)
 
     def visit_Any(self, node):
         return self.visit_reduction_op(node)

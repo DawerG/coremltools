@@ -148,7 +148,7 @@ def _concat_nd(layer_spec, input_shapes):
         axis += rank
     for shape in input_shapes[1:]:
         for idx, dim in enumerate(shape):
-            if output_shape[idx] == -1:
+            if output_shape[idx] == -1 or dim == -1:
                 continue
             if idx == axis:
                 output_shape[idx] += dim
