@@ -38,7 +38,9 @@ def _slice_static(layer_spec, input_shapes):
     for idx, dim in enumerate(input_shape):
         if dim > 0:  # known
             begin_index = 0 if params.beginMasks[idx] else params.beginIds[idx]
+            if begin_index < 0: begin_index += dim
             end_index = dim if params.endMasks[idx] else params.endIds[idx]
+            if end_index < 0: end_index += dim
             step = params.strides[idx]
             output_shape[idx] = int((end_index - begin_index) / step)
     return [output_shape]
@@ -56,14 +58,16 @@ def _squeeze(layer_spec, input_shapes):
 
     if axes is None or len(axes) == 0:
         raise NotImplementedError('Unspecified axes not implemented.')
-    output_shape = input_shape[:]
-    for axis in axes:
-        idx = axis if axis >= 0 else rank + axis
+    output_shape = []
+    axes = [axis if axis >= 0 else rank + axis for axis in axes]
+    for dim in range(rank):
+        if dim not in axes:
+            output_shape.append(input_shape[dim])
         # if input_shape[idx] != 1:
         #     raise ValueError(
         #         '[Shaper] Cannot squeeze on index %d of shape %s' % (axis, str(input_shape)))
-        output_shape = output_shape[:idx] + output_shape[idx + 1:]
-    return [output_shape]
+        # output_shape = output_shape[:idx] + output_shape[idx + 1:]
+    return [output_shape] if output_shape else [[1]]
 
 
 def _range_dynamic(layer_spec, input_shapes):
@@ -134,7 +138,7 @@ def _scatter(layer_spec, input_shapes):
 def _gather(layer_spec, input_shapes):
     if len(input_shapes) == 2:
         indices_shape = input_shapes[1]
-        return [indices_shape + input_shapes[0][1:]]
+        return [list(indices_shape) + list(input_shapes[0][1:])]
     else:
         raise ValueError("[Shaper] Gather layer accepts only 2 inputs")
 
@@ -143,7 +147,7 @@ def _gather(layer_spec, input_shapes):
 def _concat_nd(layer_spec, input_shapes):
     axis = layer_spec.concatND.axis
     rank = len(input_shapes[0])
-    output_shape = input_shapes[0][:]
+    output_shape = list(input_shapes[0][:])
     if axis < 0:
         axis += rank
     for shape in input_shapes[1:]:
@@ -236,8 +240,8 @@ def _batched_mat_mul(layer_spec, input_shapes):
         a_shape, b_shape = input_shapes
         if len(a_shape) < 2 or len(b_shape) < 2:
             raise ValueError('[Shaper] MatMul with 2 inputs require the ranks of both inputs to be no less than 2')
-        if not a_shape[0:-2] == b_shape[0:-2]:
-            raise ValueError('[Shaper] Batch dimensions in BatchedMatMul with 2 inputs mismatch')
+        # if not a_shape[0:-2] == b_shape[0:-2]:
+        #     raise ValueError('[Shaper] Batch dimensions in BatchedMatMul with 2 inputs mismatch')
         tp_a = layer_spec.batchedMatmul.transposeA
         tp_b = layer_spec.batchedMatmul.transposeB
         r_x, c_x = a_shape[-2:]
@@ -273,7 +277,7 @@ def _conv2d(layer_spec, input_shapes):
 
 def _reshape_static(layer_spec, input_shapes):
     target_shape = list(layer_spec.reshapeStatic.targetShape)
-    return [target_shape]
+    return [target_shape] if target_shape else [[1]]
 
 
 def _reduce(layer_spec, input_shapes):
@@ -342,7 +346,7 @@ def _argmax(layer_spec, input_shapes):
         output_shape[axis] = None
         output_shape = [dim for dim in output_shape if dim is not None]
 
-    return [output_shape]
+    return [output_shape] if output_shape else [[1]]
 
 
 def _argmin(layer_spec, input_shapes):
@@ -357,7 +361,7 @@ def _argmin(layer_spec, input_shapes):
         output_shape[axis] = None
         output_shape = [dim for dim in output_shape if dim is not None]
 
-    return [output_shape]
+    return [output_shape] if output_shape else [[1]]
 
 
 # We'll enable them one by one

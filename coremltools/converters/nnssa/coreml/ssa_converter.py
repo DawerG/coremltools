@@ -311,13 +311,20 @@ class SSAConverter(object):
         for idx, node_name in enumerate(instruction_order):
             node = func.graph[node_name]
             op_type = node.op
+            if node.datatype is None:
+                print("HERE")
             if op_type not in self.CONVERT_FUNCTION_MAP:
                 if len(node.attr["_output_shapes"]) == 1:
-                    self.tensor_shapes[node.name] = node.attr["_output_shapes"][0] if node.attr["_output_shapes"][0] else [1]
+                    if node.attr["_output_shapes"][0]:
+                        self.tensor_shapes[node.name] = node.attr["_output_shapes"][0]
+                    elif node.datatype:
+                        self.tensor_shapes[node.name] = node.datatype.get_shape() if node.datatype.get_shape() else [1]
+                    else:
+                        self.tensor_shapes[node.name] = [1]
                 else:
                     self.op_tensor_map[node.name] = []
                     for i in range(len(node.attr["_output_shapes"])):
-                        name = node.name + "_i"
+                        name = node.outputs[i]
                         self.tensor_shapes[name] = node.attr["_output_shapes"][i]
                         self.op_tensor_map[node.name].append(name)
 
@@ -337,6 +344,42 @@ class SSAConverter(object):
             func = self.func_stack[-1]
         return self.func_builder_map[func]
 
+    def _get_node_by_name(self, name):
+        for fname in self.func_stack[::-1]:
+            func = self.net_ensemble.functions[fname]
+            if name in func.graph:
+                return func.graph[name]
+        return None
+
+    def _check_input_shapes(self, names, types):
+        for name, type in zip(names, types):
+            propagated_shape = self.tensor_shapes[name]
+
+            if builtins.is_tensor(type):
+                inferred_shape = type.get_shape() if type.get_shape() else [1]
+            elif builtins.is_list(type):
+                element_shape = type.T[0].get_shape()
+                for ashape in type.T:
+                    assert ashape.get_shape() == element_shape
+                inferred_shape = [-1] + list(element_shape)
+            # elif builtins.is_tuple(type):
+
+            else:
+                inferred_shape = (1,)
+
+            if len(propagated_shape) != len(inferred_shape):
+                print("Here")
+
+            for pdim,idim in zip(propagated_shape, inferred_shape):
+                if pdim == -1 or idim == -1 or pdim == idim:
+                    continue
+                else:
+                    raise ValueError('[SSAConverter] Mismatch between inferred shapes '
+                                     'and propagated shapes for tensor %s' % name)
+
+            if any(True if i == 0 else False for i in inferred_shape):
+                print("Here")
+
     def _get_input_tensors(self, node):
         """ Get the input tensors for a node.
         There are two cases:
@@ -344,18 +387,44 @@ class SSAConverter(object):
         (2) (Regular case) input is a node name. In this case just copy it.
         (3) (Indexed tuple case) input is one element in a tuple. In this case it should be stored in op_tensor_map
         """
-        input_tensors = []
+        input_names = []
+        input_nodes, input_types = [], []
+
         for name in node.inputs:
             if name in self.op_tensor_map:
-                input_tensors.extend(self.op_tensor_map[name])
+                input_names.extend(self.op_tensor_map[name])
             else:
-                input_tensors.append(name)
-        return input_tensors
+                input_names.append(name)
 
-    def _get_node_by_name(self, name):
-        for func in self.func_stack[::-1]:
-            if name in self.net_ensemble.functions[func].graph:
-                return self.net_ensemble.functions[func].graph[name]
+            # input_nodes.append(self._get_node_by_name(name))
+            #
+            # if name in self.net_ensemble.variables:
+            #     input_types.append(self.net_ensemble.variables[name])
+            # else:
+            #     input_types.append(input_node[-1].datatype if input_node else None)
+        for name in input_names:
+            if name in self.net_ensemble.variables:
+                input_node = self._get_node_by_name(name + "/read")
+                input_nodes.append(input_node)
+                input_types.append(self.net_ensemble.variables[name])
+
+            else:
+                input_node = self._get_node_by_name(name)
+                input_nodes.append(input_node)
+                if input_node is not None:
+                    input_types.append(input_node.datatype)
+                else:
+                    print ("Here")
+                    continue
+                #     for key, value in self.op_tensor_map.items():
+                #         for tensor_name in value:
+                #             if tensor_name == name:
+                #                 node_name = key
+                #     input_node = self._get_node_by_name(name)
+
+        self._check_input_shapes(input_names, input_types)
+        return  input_nodes, input_names, input_types
+
 
         
     def _get_current_graph(self):
@@ -385,24 +454,20 @@ class SSAConverter(object):
         """ Convert a transpose op.
         """
         # permute dimensions are assumed to be a const
-        input_names = self._get_input_tensors(node)
-        if len(input_names) > 1:
-            dim = self._get_current_graph()[node.inputs[1]].value.val
-        else:
-            dim = node.attr.get('dim')
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
+        dim = input_nodes[1].value.val if len(input_names) > 1 else node.attr.get('dim')
         if dim is None:
             raise ValueError('[SSAConverter] Cannot handle dynamic Transpose')
         dim = list(dim)
-        input_names = self._get_input_tensors(node)
-        builder = self._get_builder()
 
+        builder = self._get_builder()
         layer = builder.add_transpose(
             name=node.name, axes=dim, input_name=input_names[0], output_name=node.name)
-
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_shape(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 1)
         builder = self._get_builder()
         layer = builder.add_get_shape(
@@ -410,7 +475,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_size(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 1)
         builder = self._get_builder()
         layer = builder.add_get_shape(
@@ -427,13 +492,13 @@ class SSAConverter(object):
 
 
     def _convert_slice(self, node):
-
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
         has_squeeze = 'squeeze' in node.attr and node.attr['squeeze']
         axes = node.attr.get('squeeze')
-        output_shapes = node.attr.get('_output_shapes')
-        output_shape = output_shapes[0] if output_shapes is not None and len(output_shapes) > 0 else None
+        # output_shapes = node.datatype.get_shape()#node.attr.get('_output_shapes')
+        # output_shape = output_shapes[0] if output_shapes is not None and len(output_shapes) > 0 else None
+        output_shape = [] if not builtins.is_tensor(node.datatype) else list(node.datatype.get_shape())
         if has_squeeze:
             if output_shape is None:
                 raise ValueError('[SSAConverter] Unable to determine output shapes for Slice')
@@ -448,11 +513,14 @@ class SSAConverter(object):
         if 'slice' not in node.attr:
             assert node.attr["new_axis_mask"] == 0
             assert len(input_names) >= 4
+            rank = len(input_nodes[0].datatype.get_shape())
+            begin_masks = [True if i in node.attr['begin_mask'] else False for i in range(rank)]
+            end_masks = [True if i in node.attr['end_mask'] else False for i in range(rank)]
             layer = builder.add_slice_dynamic(name=slice_output_name,
                                               input_names = input_names[:4],
                                               output_name  = slice_output_name,
-                                              begin_masks=node.attr['begin_mask'],
-                                              end_masks=node.attr['end_mask'])
+                                              begin_masks=begin_masks,
+                                              end_masks=end_masks)
             
             if not has_squeeze and output_shape:
                 self.tensor_shapes[node.name] = output_shape
@@ -489,12 +557,13 @@ class SSAConverter(object):
             shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_range(self, node):
-        builder = self._get_builder()
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         if len(input_names) != 3:
             raise ValueError(
                 'CoreML NeuralNetwork range layer must have 3 inputs: start, end and step')
         input_names = [input_names[1], input_names[0], input_names[2]]
+
+        builder = self._get_builder()
         layer = builder.add_range_dynamic(name=node.name, output_name=node.name, input_names=input_names)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
@@ -502,7 +571,7 @@ class SSAConverter(object):
         # TensorArray is a list of tensors, it will be treated as a rank+1 tensor when converted
         # The shape information is stored at two different places - node input specifies the length of the list
         # while the node's datatype stores the shape of each of the tensor allocated.
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 1)
 
         # Get element shape
@@ -564,22 +633,26 @@ class SSAConverter(object):
 
     def _convert_maximum(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_max_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_minimum(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_min_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_array_scatter(self, node):
         # NNSSA input order: indices, value, array
         # CoreML input order: container (array), indices, slices (value)
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         if len(input_names) != 3:
             raise ValueError('Scatter only accepts 3 inputs')
         indices, value, array = input_names
@@ -592,7 +665,9 @@ class SSAConverter(object):
         # For now, I think recording the make_tuple node itself for reference would suffice.
         if node.name in self.op_tensor_map:
             raise ValueError('make_tuple node %s should not be visited twice.' % (node.name))
-        self.op_tensor_map[node.name] = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
+        self.op_tensor_map[node.name] = input_names
 
     def _convert_while(self, node):
         # In CoreML, loops and branches should be designed such that inputs / outputs
@@ -601,7 +676,7 @@ class SSAConverter(object):
         assert (len(node.inputs) == 1)
         current_graph = self.net_ensemble.functions[self.func_stack[-1]].graph
         assert (current_graph[node.inputs[0]].op == 'make_tuple')
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         # print('[While Loop] input names:')
         # for i, name in enumerate(input_names):
         #     print('(%d) %s' %(i,name))
@@ -681,39 +756,32 @@ class SSAConverter(object):
         pass
 
     def _convert_get_tuple(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         self.op_tensor_map[node.name] = [input_names[node.attr['index']]]
 
     def _convert_get_global(self, node):
         input_name = node.attr["variable"]
-        # builder = self._get_builder()
-        # layer = builder.add_activation(
-        #     name=node.name+'_identity',
-        #     non_linearity='LINEAR',
-        #     input_name=input_name,
-        #     output_name=node.name+'_identity')
-        # shapes.propagate_single_layer(layer, self.tensor_shapes)
-        #
-        # layer = builder.add_copy(name=node.name,
-        #                          input_name=node.name+'_identity',
-        #                          output_name=input_name)
-        #
-        # shapes.propagate_single_layer(layer, self.tensor_shapes)
-        # print('Here')
         self.op_tensor_map[node.name] = [input_name]
 
 
     def _convert_set_global(self, node):
-        input_name = self._get_input_tensors(node)[0]
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         output_name = node.attr["variable"]
 
         builder = self._get_builder()
-        layer = builder.add_copy(name=node.name,
-                                 input_name=input_name,
+        layer = builder.add_copy(name=node.name + "_assign",
+                                 input_name=input_names[0],
                                  output_name=output_name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
+        if len(node.outputs) > 0:
+            layer = builder.add_copy(name=node.name,
+                                     input_name=input_names[0],
+                                     output_name=node.name)
+
+            shapes.propagate_single_layer(layer, self.tensor_shapes)
+            print("Here")
         # for f in self.net_ensemble.functions.values():
         #     for aNode in f.graph.values():
         #         if (aNode.op == "get_global"
@@ -731,117 +799,146 @@ class SSAConverter(object):
 
     def _convert_less(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_less_than(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_greater(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_greater_than(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_greater_equal(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_greater_than(
             name=node.name,
-            input_names=self._get_input_tensors(node),
+            input_names=input_names,
             output_name=node.name,
             use_greater_than_equal=True)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_equal(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_equal(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
         
     def _convert_not_equal(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_not_equal(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_logical_and(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_logical(
             name=node.name,
-            input_names=self._get_input_tensors(node),
+            input_names=input_names,
             output_name=node.name,
             mode='AND')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_logical_or(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_logical(
             name=node.name,
-            input_names=self._get_input_tensors(node),
+            input_names=input_names,
             output_name=node.name,
             mode='OR')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_logical_not(self, node):
         assert (len(node.inputs) == 1)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_logical(
             name=node.name,
-            input_names=self._get_input_tensors(node),
+            input_names=input_names,
             output_name=node.name,
             mode='NOT')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_log(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_unary(
             name=node.name,
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
             mode='log')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_rsqrt(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_unary(
             name=node.name,
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
             mode='rsqrt')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_add(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_add_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_sub(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_subtract_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_mul(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_multiply_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_real_div(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_divide_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_floor_mod(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
-        a,b = self._get_input_tensors(node)
+        a,b = input_names
         a_div_b = node.name + "_floor_div"
         floor_a = node.name + "_floor_a"
 
@@ -879,10 +976,12 @@ class SSAConverter(object):
 
     def _convert_squared_difference(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         sub_node_name = node.name + '_sub_'
 
         layer = self._get_builder().add_subtract_broadcastable(
-            name=sub_node_name, input_names=self._get_input_tensors(node), output_name=sub_node_name)
+            name=sub_node_name, input_names=input_names, output_name=sub_node_name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
         layer = self._get_builder().add_unary(
@@ -891,7 +990,7 @@ class SSAConverter(object):
 
     def _convert_select(self, node):
 
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         if (len(input_names) == 3):
             cond_name, true_name, false_name = input_names
     
@@ -917,7 +1016,7 @@ class SSAConverter(object):
             shapes.propagate_single_layer(layer, self.tensor_shapes)
             
     def _convert_softmax(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         axis = -1 if 'axis' not in node.attr else node.attr['axis']
         layer = self._get_builder().add_softmax_nd(
             name=node.name, input_name=input_names[0], output_name=node.name, axis=axis)
@@ -925,11 +1024,10 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_sum(self, node):
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
-        
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         if len(input_names) == 2:
-            axes = g[input_names[1]].value.val
+            axes = self._get_node_by_name(input_names[1]).value.val
             reduction_indices = list(axes) if isinstance(axes, Iterable) else [axes]
         elif 'reduction_indices' in node.attr:
             reduction_indices = node.attr['reduction_indices']
@@ -954,11 +1052,11 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_prod(self, node):
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
-        
+
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         if len(input_names) == 2:
-            axes = g[input_names[1]].value.val
+            axes = self._get_node_by_name(input_names[1]).value.val
             reduction_indices = list(axes) if isinstance(axes, Iterable) else [axes]
         elif 'reduction_indices' in node.attr:
             reduction_indices = node.attr['reduction_indices']
@@ -980,7 +1078,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_mean(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         reduction_indices = node.attr['reduction_indices']
         keepdims = node.attr['keep_dims']
 
@@ -994,7 +1092,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_max(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         reduction_indices = node.attr['reduction_indices']
         keepdims = node.attr['keep_dims']
 
@@ -1008,7 +1106,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_min(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         reduction_indices = node.attr['reduction_indices']
         keepdims = node.attr['keep_dims']
 
@@ -1024,7 +1122,7 @@ class SSAConverter(object):
     def _convert_tensorarray_read(self, node):
         # TensorArrayReadV3 slices an element from TensorArray, which in NNSSA is a list.
         # This is equivalent to array gather
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         slice_output_name = node.name + '_slice_'
         layer = self._get_builder().add_gather(
             name=node.name + '_gather_',
@@ -1047,7 +1145,7 @@ class SSAConverter(object):
         return array
         """
         # node.inputs = ['index', 'value', 'array']
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 3)
         index_name, value_name, array_name = input_names
         values_name = node.name + '_expanded'
@@ -1064,29 +1162,28 @@ class SSAConverter(object):
 
     def _convert_concat_nd(self, node):
         assert (len(node.inputs) > 1)
-
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         axis = node.attr.get('axis')
         if axis is None:
-            axis = g[input_names[-1]].value
+            axis = self._get_node_by_name(input_names[-1]).value
         if axis is None:
             raise NotImplementedError('[SSAConverter] Dynamic concatenation is not supported')
         axis = axis.val
         layer = self._get_builder().add_concat_nd(
             name=node.name, input_names=input_names[:-1], output_name=node.name, axis=axis)
-        shapes.propagate_single_layer(layer, self.tensor_shapes)
+        self.tensor_shapes[node.name] = list(node.datatype.get_shape())
+
+        # shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_pad(self, node):
         if len(node.inputs) == 2:
-            input_names = self._get_input_tensors(node)
-            g = self._get_current_graph()
+            input_nodes, input_names, input_types = self._get_input_tensors(node)
             layer = self._get_builder().add_concat_nd(
                 name=node.name, input_names=input_names, output_name=node.name, axis=-1)
-        self.tensor_shapes[node.name] = node.attr["_output_shapes"][0]
+        self.tensor_shapes[node.name] = node.datatype.get_shape()
 
     def _convert_cumsum(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         inp, axes = input_names[0], input_names[1]
         # reverse_axes = self._get_current_graph()[axes].attr['value'].val
         # rank = len(self.tensor_shapes[inp])
@@ -1097,16 +1194,15 @@ class SSAConverter(object):
         self.tensor_shapes[node.name] = self.tensor_shapes[input_names[0]]
 
     def _convert_batched_mat_mul(self, node):
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
         weight, bias = None, None
         if len(input_names) == 1:
             weight = node.attr.get('W', node.attr.get('W_const'))
             bias = node.attr.get('bias')
-        elif len(input_names) == 2 and g[node.inputs[1]].op == 'Const':
+        elif len(input_names) == 2 and self._get_node_by_name(input_names[1]).op == 'Const':
             input_names = [input_names[0]]
-            weight = g[node.inputs[1]].value.val
+            weight = self._get_node_by_name(input_names[1]).value.val
             bias = node.attr.get('bias')
 
         transpose_a = node.attr.get('adj_x', False) or node.attr.get('transpose_a', False)
@@ -1135,7 +1231,7 @@ class SSAConverter(object):
 
     def _convert_bias_add(self, node):
         assert (len(node.inputs) == 2)
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
         layer = self._get_builder().add_add_broadcastable(
             name=node.name, input_names=input_names, output_name=node.name)
@@ -1149,10 +1245,10 @@ class SSAConverter(object):
         # if not all([x == split[0] for x in split]):
         #     raise NotImplementedError('[SSAConverter] Uneven split is not supported')
         num_splits = len(split)
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
         # Split output is a tuple. We need to split them into a list of tensors
-        output_names = [(node.name + '_' + str(i) + '_') for i in range(num_splits)]
+        output_names = node.outputs #[(node.name + '_' + str(i) + '_') for i in range(num_splits)]
         if node.name in self.op_tensor_map:
             raise ValueError(
                 '[SSAConverter] split node %s should not be visited twice.' % node.name)
@@ -1171,63 +1267,74 @@ class SSAConverter(object):
             shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_sigmoid(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_activation(
             name=node.name,
             non_linearity='SIGMOID',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_relu(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_activation(
             name=node.name,
             non_linearity='RELU',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_elu(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_activation(
             name=node.name,
             non_linearity='ELU',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
             params = 1.0)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_leaky_relu(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         builder = self._get_builder()
         layer = builder.add_activation(
             name=node.name,
             non_linearity='LEAKYRELU',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
             params=([node.attr['alpha']]))
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_tanh(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         builder = self._get_builder()
         layer = builder.add_activation(
             name=node.name,
             non_linearity='TANH',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_identity(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_activation(
             name=node.name,
             non_linearity='LINEAR',
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
             params=(1.0, 0.0))
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_tensorarray_size(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 1)
         builder = self._get_builder()
         layer = builder.add_get_shape(
@@ -1248,7 +1355,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_tensorarray_gather(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         assert (len(input_names) == 2)
         layer = self._get_builder().add_gather(
             name=node.name, input_names=input_names[::-1], output_name=node.name, axis=0)
@@ -1256,9 +1363,13 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_pack(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         if len(input_names) == 1:
             self.op_tensor_map[node.name] = input_names
+
+        elif all([not builtins.is_tensor(input_type) for input_type in input_types]):
+            layer = self._get_builder().add_concat_nd(
+                name=node.name, input_names=input_names, output_name=node.name, axis=0)
         else:
             layer = self._get_builder().add_stack(
                 name=node.name, input_names=input_names, output_name=node.name, axis=0)
@@ -1270,7 +1381,7 @@ class SSAConverter(object):
             shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_unpack(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         output_names = node.outputs
         self.op_tensor_map[node.name] = output_names
         num_splits = node.attr['num']
@@ -1287,7 +1398,7 @@ class SSAConverter(object):
             shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_gather(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         # NNSSA: [u'encoder/Variable/read', u'Placeholder', u'encoder/embedding_lookup/axis']
         # CoreML         Given two inputs, 'data' and 'indices', gather the slices of 'data'
         axis = node.attr['axis']
@@ -1297,7 +1408,7 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_gather_nd(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_gather_nd(
             name=node.name,
             input_names=input_names[0:2],
@@ -1308,7 +1419,7 @@ class SSAConverter(object):
         # shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_scatter_nd(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_scatter_nd(
             name=node.name,
             input_names=input_names[0:2],
@@ -1317,32 +1428,34 @@ class SSAConverter(object):
         self.tensor_shapes[node.name] = node.attr["_output_shapes"][0]
 
     def _convert_sqrt(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_unary(
             name=node.name, input_name=input_names[0], output_name=node.name, mode='sqrt')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_exp(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_unary(
             name=node.name, input_name=input_names[0], output_name=node.name, mode='exp')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_square(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_elementwise(
             name=node.name, input_names=input_names * 2, output_name=node.name, mode='MULTIPLY')
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_pow(self, node):
         assert (len(node.inputs) == 2)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_pow_broadcastable(
-            name=node.name, input_names=self._get_input_tensors(node), output_name=node.name)
+            name=node.name, input_names=input_names, output_name=node.name)
 
         shapes.propagate_single_layer(layer, self.tensor_shapes)
         
     def _convert_conv2d(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         g = self._get_current_graph()
 
         weight = None
@@ -1399,22 +1512,36 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes, output_shapes=node.attr.get('_output_shapes'))
 
     def _convert_reshape(self, node):
-        input_names = self._get_input_tensors(node)
-        if '_output_shapes' in node.attr and node.attr['_output_shapes']:
-            output_shape = node.attr['_output_shapes'][0]
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+        target_shape = node.datatype.get_shape()
+
+        if target_shape:
             layer = self._get_builder().add_reshape_static(
-                name=node.name,
-                input_name=input_names[0],
-                output_name=node.name,
-                output_shape=output_shape)
+                    name=node.name,
+                    input_name=input_names[0],
+                    output_name=node.name,
+                    output_shape=target_shape)
+            shapes.propagate_single_layer(layer, self.tensor_shapes)
         else:
-            layer = self._get_builder().add_reshape_dynamic(
-                name=node.name, input_names=input_names, output_name=node.name)
-        shapes.propagate_single_layer(layer, self.tensor_shapes)
+            self.op_tensor_map[node.name] = [input_names[0]]
+        # if '_output_shapes' in node.attr and node.attr['_output_shapes'][0]:
+        #     output_shape = node.attr['_output_shapes'][0]
+        #     layer = self._get_builder().add_reshape_static(
+        #         name=node.name,
+        #         input_name=input_names[0],
+        #         output_name=node.name,
+        #         output_shape=output_shape)
+        #     shapes.propagate_single_layer(layer, self.tensor_shapes)
+        # else:
+        #     layer = self._get_builder().add_reshape_dynamic(
+        #         name=node.name, input_names=input_names, output_name=node.name)
+        #
+        #     shape = self._get_node_by_name(node.name).datatype.get_shape()
+        #     self.tensor_shapes[node.name] = shape if shape else [1]
 
     def _convert_argmax(self, node):
-        input_names = self._get_input_tensors(node)
-        input_shape = self._get_current_graph()[node.inputs[0]].attr['_output_shapes'][0]
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+        input_shape = self._get_node_by_name(input_names[0]).attr['_output_shapes'][0]
         axis = node.attr['reduction_indices'][0]
 
         layer = self._get_builder().add_argmax(
@@ -1426,9 +1553,9 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_reverse(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         inp, axes = input_names[0], input_names[1]
-        reverse_axes = self._get_current_graph()[axes].attr['value'].val
+        reverse_axes = self._get_node_by_name(axes).attr['value'].val
         rank = len(self.tensor_shapes[inp])
         reverse_dim = [False] * rank
         for axis in reverse_axes:
@@ -1439,19 +1566,18 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_expand_dims(self, node):
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
-        if len(input_names) == 2 and g[node.inputs[1]].attr['value'].val is None:
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+        if len(input_names) == 2 and self._get_node_by_name(input_names[1]).attr['value'].val is None:
             raise NotImplementedError("[SSAConverter] Cannot handle dynamic expandDims")
 
-        axes = g[node.inputs[1]].attr['value'].val
+        axes = self._get_node_by_name(input_names[1]).attr['value'].val
         layer = self._get_builder().add_expand_dims(
             name=node.name, input_name=input_names[0], output_name=node.name, axes=axes)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
 
     def _convert_squeeze(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
 
         axes = node.attr["squeeze_dims"]
         layer = self._get_builder().add_squeeze(
@@ -1462,13 +1588,15 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_cast(self, node):
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+
         layer = self._get_builder().add_round(name=node.name,
-                                              input_name=self._get_input_tensors(node)[0],
+                                              input_name=input_names[0],
                                               output_name=node.name)
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_reverse_sequence(self, node):
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         batch_axis= node.attr['batch_dim']
         seq_axis = node.attr['seq_dim']
 
@@ -1481,13 +1609,12 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_embedding(self, node):
-        input_names = self._get_input_tensors(node)
-        g = self._get_current_graph()
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         weight = None
         if len(input_names) == 1:
             weight = node.attr.get('W')
-        elif len(input_names) == 2 and g[input_names[1]].op == 'Const':
-            weight = g[input_names[1]].value.val  # (batch, depth, out_channels)
+        elif len(input_names) == 2 and self._get_node_by_name(input_names[1]).op == 'Const':
+            weight = self._get_node_by_name(input_names[1]).value.val  # (batch, depth, out_channels)
 
         if weight is None:
             raise ValueError('[SSAConverter] Unable to handle dynamic embedding')
@@ -1513,9 +1640,10 @@ class SSAConverter(object):
 
     def _convert_floor_div(self, node):
         assert len(node.inputs) == 2
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_floor_div_broadcastable(
             name=node.name,
-            input_names=self._get_input_tensors(node),
+            input_names=input_names,
             output_name=node.name,
         )
         shapes.propagate_single_layer(layer, self.tensor_shapes)
@@ -1523,30 +1651,34 @@ class SSAConverter(object):
 
     def _convert_sin(self, node):
         assert len(node.inputs) == 1
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_sin(
             name=node.name,
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
         )
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_cos(self, node):
         assert len(node.inputs) == 1
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         layer = self._get_builder().add_cos(
             name=node.name,
-            input_name=self._get_input_tensors(node)[0],
+            input_name=input_names[0],
             output_name=node.name,
         )
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_tile(self, node):
         assert len(node.inputs) == 2
-        reps_name = self._get_input_tensors(node)[1]
-        if self._get_current_graph()[reps_name].op == 'Const':
-            reps = self._get_current_graph()[reps_name].value.val
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
+        reps_name = input_names[1]
+        reps_node = input_nodes[1]
+        if reps_node.op == 'Const':
+            reps = reps_node.value.val
             layer = self._get_builder().add_tile(
                 name=node.name,
-                input_name=self._get_input_tensors(node)[0],
+                input_name=input_names[0],
                 output_name=node.name,
                 reps=reps
             )
@@ -1556,10 +1688,9 @@ class SSAConverter(object):
 
     def _convert_fill(self, node):
         assert len(node.inputs) == 2
-        
-        input_names = self._get_input_tensors(node)
+        input_nodes, input_names, input_types = self._get_input_tensors(node)
         inp, val = input_names[0], input_names[1]
-        value = self._get_current_graph()[val].attr['value'].val[0]
+        value = self._get_node_by_name(val).attr['value'].val[0]
 
         layer = self._get_builder().add_fill_dynamic(name=node.name,
                                          input_name=inp,
@@ -1568,5 +1699,4 @@ class SSAConverter(object):
         shapes.propagate_single_layer(layer, self.tensor_shapes)
 
     def _convert_one_hot(self, node):
-
         self.tensor_shapes[node.name] = node.attr['_output_shapes'][0]

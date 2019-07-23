@@ -64,8 +64,8 @@ def load(tfgraph, resume_on_errors=False, **kwargs):
     for f in ssa.functions.values():
         f.find_inputs_and_outputs()
     # # check that type inference is complete
-    # if resume_on_errors == False:
-    #     for f in ssa.functions.values():
-    #         for n in f.graph.values():
-    #             assert (n.datatype is not None)
+    if resume_on_errors == False:
+        for f in ssa.functions.values():
+            for n in f.graph.values():
+                assert (n.datatype is not None)
     return ssa

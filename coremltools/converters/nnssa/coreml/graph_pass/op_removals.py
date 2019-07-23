@@ -82,6 +82,9 @@ def _remove_internal_identity_nodes(nnssa):
                 delete_count += 1
                 parent_name = f.graph[k].inputs[0]
                 disconnect_edge(f.graph, parent_name, k)
+                for control_input in f.graph[k].control_inputs:
+                    replace_control_dest(f.graph, control_input, k, parent_name)
+
                 replace_node(f.graph, k, parent_name)  # join parent to children
                 delete_node(f.graph, k)
 

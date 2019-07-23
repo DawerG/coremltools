@@ -183,6 +183,7 @@ def const_determined_nodes(gd, assume_variable_nodes=[]):
         else:
             ret = True
             vis[node.name] = False
+
             for innode in node.inputs:
                 if innode not in vis:
                     visit(innode)
